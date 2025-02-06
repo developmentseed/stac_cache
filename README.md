@@ -29,7 +29,6 @@ time uv run stac_cache.py \
   --end-date=2023-08-31 \
   --limit=2000 \
   --output=hls_boreal_20230701-20230831.parquet \
-  --client=pystac-client \
   --max-workers=4 \
   --x-chunk-size=180 \
   --y-chunk-size=10
@@ -37,15 +36,14 @@ time uv run stac_cache.py \
 
 ```bash
 time uv run stac_cache.py \
-  --stac-api=https://cmr.earthdata.nasa.gov/stac/LPCLOUD/ \
-  --collections HLSL30_2.0 HLSS30_2.0 \
-  --bbox=-180,70,0,80 \
+  --stac-api=https://planetarycomputer.microsoft.com/api/stac/v1 \
+  --collections sentinel-2-l2a \
+  --bbox=-180,30,0,80 \
   --start-date=2023-07-01 \
-  --end-date=2023-07-03 \
-  --limit=2000 \
-  --output=hls_boreal_20230701-20230703.parquet \
-  --client=pystac-client \
+  --end-date=2023-07-05 \
+  --limit=1000 \
+  --output=/tmp/sentinel-2 \
   --max-workers=4 \
-  --x-chunk-size=180 \
-  --y-chunk-size=10
+  --x_chunk_size=60 \
+  --y_chunk_size=10
 ```

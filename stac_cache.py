@@ -14,6 +14,9 @@
 
 import argparse
 import asyncio
+import hashlib
+import json
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
@@ -26,6 +29,25 @@ import pyarrow.parquet as pq
 import pystac
 import stac_geoparquet
 from tqdm import tqdm
+
+
+def generate_params_hash(args: argparse.Namespace) -> str:
+    """Generate a hash from the request parameters."""
+    # Create a dictionary of relevant parameters
+    params = {
+        "collections": sorted(args.collections),  # Sort for consistency
+        "bbox": args.bbox,
+        "stac_api": args.stac_api,
+        "filter": args.filter,
+        "start_date": args.start_date.isoformat(),
+        "end_date": args.end_date.isoformat(),
+    }
+
+    # Convert to JSON string for consistent serialization
+    params_str = json.dumps(params, sort_keys=True)
+
+    # Generate hash
+    return hashlib.sha256(params_str.encode()).hexdigest()[:12]
 
 
 def parse_bbox_string(bbox_str: str) -> tuple[float, float, float, float]:
@@ -125,16 +147,16 @@ def parse_args():
         "--output",
         type=Path,
         required=True,
-        help="Output parquet file path",
+        help="Output directory for geoparquet archive",
     )
     parser.add_argument(
-        "--x-chunk-size",
+        "--x_chunk_size",
         type=float,
-        default=180.0,
+        default=60.0,
         help="Size of x-axis chunks in degrees (default: 180.0)",
     )
     parser.add_argument(
-        "--y-chunk-size",
+        "--y_chunk_size",
         type=float,
         default=10.0,
         help="Size of y-axis chunks in degrees (default: 20.0)",
@@ -189,14 +211,16 @@ async def search_stac_api(
 
         # Get next page
         response = await client.get(next_link)
-        response.raise_for_status()
+        if response.status_code != 200:
+            raise Exception(
+                f"request to {response.url} failed with status code {response.status_code}"
+            )
+
         result = response.json()
 
         # Add features from this page
         all_features.extend(result.get("features", []))
         page_count += 1
-
-    print(f"Retrieved {len(all_features)} items across {page_count} pages")
 
     # Construct final result maintaining the original structure
     final_result = {
@@ -213,7 +237,6 @@ async def process_search_batch(
     client: httpx.AsyncClient,
     api_url: str,
     search_params: Dict[str, Any],
-    intermediate_dir: Path,
     semaphore: asyncio.Semaphore,
 ) -> list[Path]:
     """Process a batch of search parameters and save results."""
@@ -226,11 +249,9 @@ async def process_search_batch(
             if not result.get("features"):
                 return []
 
-            # Create filename from parameters
-            chunk_file = (
-                intermediate_dir
-                / f"{search_params['datetime'][:10]}_{'_'.join(str(coord) for coord in search_params['bbox'])}.parquet"
-            )
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+                chunk_file = Path(tmp.name)
 
             # Convert to arrow and save
             items = pystac.ItemCollection(result["features"])
@@ -250,8 +271,6 @@ async def main():
 
     if args.end_date < args.start_date:
         raise ValueError("End date must be after start date")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
 
     # generate set of bboxes and dates (same as before)
     bbox_combinations = chunk_bbox(
@@ -290,18 +309,19 @@ async def main():
     print(f"Number of dates: {len(date_range)}")
     print(f"Number of bbox combinations: {len(bbox_combinations)}")
 
+    # Generate hash and create output filename
+    params_hash = generate_params_hash(args)
+    output_path = args.output / f"stac_cache_{params_hash}.parquet"
+
     # Setup filesystem
     if str(args.output).startswith("s3://"):
         s3 = fs.S3FileSystem()
         output_fs = s3
-        output_path = str(args.output).replace("s3://", "")
+        output_path_str = str(output_path).replace("s3://", "")
     else:
+        args.output.mkdir(parents=True, exist_ok=True)
         output_fs = fs.LocalFileSystem()
-        output_path = str(args.output)
-
-    # Create intermediate directory
-    intermediate_dir = Path("/tmp") / args.output.stem
-    intermediate_dir.mkdir(parents=True, exist_ok=True)
+        output_path_str = str(output_path)
 
     # Create semaphore for controlling concurrency
     semaphore = asyncio.Semaphore(args.max_workers)
@@ -310,9 +330,7 @@ async def main():
 
     async with httpx.AsyncClient(timeout=300) as client:
         tasks = [
-            process_search_batch(
-                client, args.stac_api, params, intermediate_dir, semaphore
-            )
+            process_search_batch(client, args.stac_api, params, semaphore)
             for params in search_params
         ]
 
@@ -328,21 +346,20 @@ async def main():
 
     print(f"Wrote results to {len(all_files)} parquet files")
 
-    # Combine all parquet files (same as before)
+    # Combine all parquet files
     if all_files:
-        print(f"Combining {len(all_files)} files into {args.output}")
+        print(f"Combining {len(all_files)} files into {output_path}")
 
         dataset = ds.dataset(all_files, format="parquet")
         table = dataset.to_table()
 
-        pq.write_table(table, output_path, filesystem=output_fs)
+        pq.write_table(table, output_path_str, filesystem=output_fs)
 
+        # Clean up temporary files
         for temp_file in all_files:
             Path(temp_file).unlink()
 
-        intermediate_dir.rmdir()
-
-        print(f"Successfully combined all files into {args.output}")
+        print(f"Successfully combined all files into {output_path}")
     else:
         print("No results found to combine")
 
