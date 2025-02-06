@@ -1,11 +1,11 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "backoff",
+#     "httpx",
 #     "pyarrow",
 #     "pystac",
-#     "pystac-client",
 #     "stac_geoparquet",
-#     "stacrs",
 #     "retry",
 #     "s3fs",
 #     "tqdm",
@@ -14,17 +14,17 @@
 
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Dict
 
+import backoff
+import httpx
 import pyarrow.dataset as ds
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
 import pystac
-import pystac_client
 import stac_geoparquet
-from retry import retry
 from tqdm import tqdm
 
 
@@ -153,22 +153,96 @@ def parse_args():
     return parser.parse_args()
 
 
-@retry(tries=3, delay=30, backoff=2)
-def search_pystac_client(
-    client: pystac_client.Client, *args, **kwargs
-) -> pystac.ItemCollection:
-    """Execute a STAC search with any search parameters."""
-    search = client.search(*args, **kwargs)
+@backoff.on_exception(
+    backoff.expo,
+    (httpx.HTTPError, Exception),
+    max_tries=3,
+    max_time=300,
+)
+async def search_stac_api(
+    client: httpx.AsyncClient, api_url: str, params: Dict[Any, Any]
+) -> dict:
+    """Execute a STAC search using httpx."""
+    search_url = f"{api_url}/search"
 
-    items = search.item_collection()
-    if limit := kwargs.get("limit"):
-        if len(items) == limit:
-            raise ValueError(
-                f"this query returned exactly the limit of {limit} items! "
-                f"that means these results are probably incomplete {kwargs}"
+    # Initialize with first response
+    response = await client.post(search_url, json=params)
+    response.raise_for_status()
+    result = response.json()
+
+    # Store all features
+    all_features = result.get("features", [])
+
+    # Keep track of number of pages for logging
+    page_count = 1
+
+    while True:
+        # Look for next link
+        next_link = None
+        for link in result.get("links", []):
+            if link["rel"] == "next":
+                next_link = link["href"]
+                break
+
+        if not next_link:
+            break
+
+        # Get next page
+        response = await client.get(next_link)
+        response.raise_for_status()
+        result = response.json()
+
+        # Add features from this page
+        all_features.extend(result.get("features", []))
+        page_count += 1
+
+    print(f"Retrieved {len(all_features)} items across {page_count} pages")
+
+    # Construct final result maintaining the original structure
+    final_result = {
+        "type": "FeatureCollection",
+        "features": all_features,
+        "links": result.get("links", []),  # Keep the links from the last page
+        "context": result.get("context", {}),  # Keep any context from the last page
+    }
+
+    return final_result
+
+
+async def process_search_batch(
+    client: httpx.AsyncClient,
+    api_url: str,
+    search_params: Dict[str, Any],
+    intermediate_dir: Path,
+    semaphore: asyncio.Semaphore,
+) -> list[Path]:
+    """Process a batch of search parameters and save results."""
+    all_files = []
+
+    async with semaphore:
+        try:
+            result = await search_stac_api(client, api_url, search_params)
+
+            if not result.get("features"):
+                return []
+
+            # Create filename from parameters
+            chunk_file = (
+                intermediate_dir
+                / f"{search_params['datetime'][:10]}_{'_'.join(str(coord) for coord in search_params['bbox'])}.parquet"
             )
 
-    return items
+            # Convert to arrow and save
+            items = pystac.ItemCollection(result["features"])
+            rbr = stac_geoparquet.arrow.parse_stac_items_to_arrow(items)
+            stac_geoparquet.arrow.to_parquet(rbr, chunk_file)
+
+            all_files.append(chunk_file)
+
+        except Exception as exc:
+            print(f"Search with params {search_params} generated an exception: {exc}")
+
+    return all_files
 
 
 async def main():
@@ -179,14 +253,13 @@ async def main():
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # generate set of bboxes
+    # generate set of bboxes and dates (same as before)
     bbox_combinations = chunk_bbox(
         args.bbox,
         x_chunk_size=args.x_chunk_size,
         y_chunk_size=args.y_chunk_size,
     )
 
-    # generate date range
     date_range = [
         args.start_date + timedelta(days=x)
         for x in range((args.end_date - args.start_date).days + 1)
@@ -198,7 +271,6 @@ async def main():
         "limit": args.limit,
     }
 
-    # Add optional parameters
     if args.filter:
         base_params["filter"] = args.filter
 
@@ -218,6 +290,7 @@ async def main():
     print(f"Number of dates: {len(date_range)}")
     print(f"Number of bbox combinations: {len(bbox_combinations)}")
 
+    # Setup filesystem
     if str(args.output).startswith("s3://"):
         s3 = fs.S3FileSystem()
         output_fs = s3
@@ -230,49 +303,32 @@ async def main():
     intermediate_dir = Path("/tmp") / args.output.stem
     intermediate_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create semaphore for controlling concurrency
+    semaphore = asyncio.Semaphore(args.max_workers)
+
     all_files = []
-    max_workers = min(len(search_params), args.max_workers)
 
-    executor = ThreadPoolExecutor(max_workers=max_workers)
-
-    try:
-        progress_bar = tqdm(
-            total=len(search_params), desc="Processing searches", unit="search"
-        )
-        client = pystac_client.Client.open(args.stac_api)
-
-        future_to_params = {
-            executor.submit(search_pystac_client, client, **params): params
+    async with httpx.AsyncClient(timeout=300) as client:
+        tasks = [
+            process_search_batch(
+                client, args.stac_api, params, intermediate_dir, semaphore
+            )
             for params in search_params
-        }
+        ]
 
-        # Process completed tasks as they finish
-        for future in as_completed(future_to_params):
-            params = future_to_params[future]
-            try:
-                items = future.result()
-                if not items:
-                    continue
-                chunk_file = (
-                    intermediate_dir
-                    / f"{params['datetime'][:10]}_{'_'.join(str(coord) for coord in params['bbox'])}.parquet"
-                )
-                rbr = stac_geoparquet.arrow.parse_stac_items_to_arrow(items)
-                stac_geoparquet.arrow.to_parquet(rbr, chunk_file)
-                all_files.append(chunk_file)
-
-            except Exception as exc:
-                print(f"Search with params {params} generated an exception: {exc}")
-            finally:
-                progress_bar.update(1)
-
-        progress_bar.close()
-    finally:
-        executor.shutdown()
+        # Use tqdm to show progress
+        for task in tqdm(
+            asyncio.as_completed(tasks),
+            total=len(tasks),
+            desc="Processing searches",
+            unit="search",
+        ):
+            files = await task
+            all_files.extend(files)
 
     print(f"Wrote results to {len(all_files)} parquet files")
 
-    # Combine all parquet files
+    # Combine all parquet files (same as before)
     if all_files:
         print(f"Combining {len(all_files)} files into {args.output}")
 
