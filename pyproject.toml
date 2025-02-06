@@ -1,0 +1,17 @@
+[project]
+name = "stac-cache"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ipython>=8.32.0",
+    "pyarrow>=19.0.0",
+    "pystac>=1.12.1",
+    "pystac-client>=0.8.5",
+    "retry>=0.9.2",
+    "s3fs>=2025.2.0",
+    "stac-geoparquet>=0.6.0",
+    "stacrs>=0.4.0",
+    "tqdm>=4.67.1",
+]
