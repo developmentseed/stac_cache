@@ -192,6 +192,10 @@ async def search_stac_api(
     response.raise_for_status()
     result = response.json()
 
+    if context := result.get("context"):
+        if context["matched"] >= params["limit"]:
+            raise ValueError(f"this request returned more than the limit: {params}")
+
     # Store all features
     all_features = result.get("features", [])
 

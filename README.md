@@ -20,19 +20,47 @@ uv sync
 
 ## Usage
 
+### Example: cache HLS records for the circumpolar boreal region for July-August 2019, 2022, 2023
+
 ```bash
 time uv run stac_cache.py \
-  --stac-api=https://cmr.earthdata.nasa.gov/stac/LPCLOUD/ \
-  --collections HLSS30_2.0 \
+  --stac-api=https://cmr.earthdata.nasa.gov/stac/LPCLOUD \
+  --collections HLSS30_2.0 HLSL30_2.0 \
   --bbox=-180,30,180,80 \
   --start-date=2023-07-01 \
   --end-date=2023-08-31 \
   --limit=2000 \
-  --output=hls_boreal_20230701-20230831.parquet \
-  --max-workers=4 \
-  --x-chunk-size=180 \
-  --y-chunk-size=10
+  --output=hls_boreal_20230701-20230831 \
+  --max-workers=2 \
+  --x_chunk_size=120 \
+  --y_chunk_size=10
+
+time uv run stac_cache.py \
+  --stac-api=https://cmr.earthdata.nasa.gov/stac/LPCLOUD \
+  --collections HLSS30_2.0 HLSL30_2.0 \
+  --bbox=-180,30,180,80 \
+  --start-date=2022-07-01 \
+  --end-date=2022-08-31 \
+  --limit=2000 \
+  --output=hls_boreal_20220701-20220831 \
+  --max-workers=2 \
+  --x_chunk_size=120 \
+  --y_chunk_size=10
+
+time uv run stac_cache.py \
+  --stac-api=https://cmr.earthdata.nasa.gov/stac/LPCLOUD \
+  --collections HLSS30_2.0 HLSL30_2.0 \
+  --bbox=-180,30,180,80 \
+  --start-date=2019-07-01 \
+  --end-date=2019-08-31 \
+  --limit=2000 \
+  --output=hls_boreal_20190701-20190831 \
+  --max-workers=2 \
+  --x_chunk_size=120 \
+  --y_chunk_size=10
 ```
+
+### Example: cache sentinel-2-l2a records from Microsoft Planetary Computer
 
 ```bash
 time uv run stac_cache.py \
