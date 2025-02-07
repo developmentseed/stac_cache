@@ -23,6 +23,8 @@ from typing import Any, Dict
 
 import backoff
 import httpx
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
@@ -357,7 +359,19 @@ async def main():
         dataset = ds.dataset(all_files, format="parquet")
         table = dataset.to_table()
 
-        pq.write_table(table, output_path_str, filesystem=output_fs)
+        # Filter down to unique rows by by taking the first record that has a given id
+        id_column = table["id"]
+
+        idx = pc.array_sort_indices(id_column)
+        sorted_ids = id_column.take(idx)
+        prev_ids = sorted_ids.slice(0, len(sorted_ids) - 1)
+        curr_ids = sorted_ids.slice(1)
+        changes = pc.not_equal(curr_ids, prev_ids)
+
+        firsts = pa.array([True] + changes.to_pylist())
+
+        unique_table = table.take(idx.filter(firsts))
+        pq.write_table(unique_table, output_path_str, filesystem=output_fs)
 
         # Clean up temporary files
         for temp_file in all_files:
